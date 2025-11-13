@@ -1,0 +1,173 @@
+name: RDP-30Days
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # هەموو ٦ کاتژمێر جارێک
+
+jobs:
+  rdp-setup:
+    runs-on: windows-latest
+    timeout-minutes: 350  # ٥ کاتژمێر و ٥٠ خولەک
+    steps:
+      - name: Configure RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+          Write-Host "✅ RDP configured"
+
+      - name: Create User
+        run: |
+          $password = "RDP@" + (Get-Date -Format "MMdd") + "!GitHub"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          if (Get-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDPUser"
+          }
+          
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+          
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "✅ User created"
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          try {
+              Write-Host "Downloading Tailscale from: $tsUrl"
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -ErrorAction Stop
+              
+              Write-Host "Installing Tailscale..."
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -NoNewWindow
+              Remove-Item $installerPath -Force
+              
+              Start-Sleep -Seconds 15
+              Write-Host "✅ Tailscale installed successfully"
+          } catch {
+              Write-Host "❌ Tailscale installation failed: $($_.Exception.Message)"
+              Write-Host "Continuing without Tailscale..."
+              echo "TAILSCALE_IP=no-tailscale" >> $env:GITHUB_ENV
+          }
+
+      - name: Connect Tailscale
+        run: |
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+              Write-Host "Connecting to Tailscale..."
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=github-rdp-30d
+              
+              $tsIP = $null
+              for ($i = 0; $i -lt 10; $i++) {
+                  Start-Sleep -Seconds 5
+                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                  if ($tsIP -and $tsIP -match '^\d+\.\d+\.\d+\.\d+$') {
+                      Write-Host "✅ Tailscale IP: $tsIP"
+                      echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+                      break
+                  }
+              }
+              
+              if (-not $tsIP) {
+                  Write-Host "⚠️ Could not get Tailscale IP"
+                  echo "TAILSCALE_IP=check-manually" >> $env:GITHUB_ENV
+              }
+          } else {
+              Write-Host "📝 Tailscale not installed, using direct connection"
+              echo "TAILSCALE_IP=direct-connection" >> $env:GITHUB_ENV
+          }
+
+      - name: Get Public IP
+        run: |
+          try {
+              $publicIP = (Invoke-WebRequest -Uri "https://api.ipify.org" -UseBasicParsing).Content
+              Write-Host "🌍 Public IP: $publicIP"
+              echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
+          } catch {
+              Write-Host "⚠️ Could not get public IP"
+              echo "PUBLIC_IP=unknown" >> $env:GITHUB_ENV
+          }
+
+      - name: Final Setup
+        run: |
+          powercfg -change -standby-timeout-ac 0
+          powercfg -change -hibernate-timeout-ac 0
+          powercfg -change -monitor-timeout-ac 0
+          
+          Write-Host "🎉 RDP SETUP COMPLETED!"
+          Write-Host "========================"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Public IP: $env:PUBLIC_IP"
+          Write-Host "User: RDPUser"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "Duration: 30 DAYS"
+          Write-Host "========================"
+          
+          $info = @"
+RDP Connection Info - 30 Days
+=============================
+Tailscale IP: $env:TAILSCALE_IP
+Public IP: $env:PUBLIC_IP
+Username: RDPUser
+Password: $env:RDP_PASSWORD
+Setup Time: $(Get-Date)
+Expires: $((Get-Date).AddDays(30))
+
+Instructions:
+1. If using Tailscale: Connect via Tailscale IP
+2. If direct connection: Use Public IP (port 3389)
+3. Username: RDPUser
+4. Password: $env:RDP_PASSWORD
+
+Note: Auto-restarts every 6 hours for 30 days.
+"@
+          $info | Out-File -FilePath "C:\RDP_Info.txt" -Encoding UTF8
+
+      - name: Maintain Connection
+        run: |
+          $startTime = Get-Date
+          $totalDays = 30
+          $sessionEnd = $startTime.AddMinutes(345)
+          
+          Write-Host "🚀 RDP Session Started - 30 Days Total"
+          Write-Host "⏰ This session: 5 hours 45 minutes"
+          Write-Host "🔄 Next auto-restart: $($startTime.AddMinutes(345))"
+          
+          while ((Get-Date) -lt $sessionEnd) {
+              $currentTime = Get-Date
+              $elapsedTotal = $currentTime - $startTime
+              $daysPassed = [math]::Round($elapsedTotal.TotalDays, 2)
+              $remainingDays = $totalDays - $daysPassed
+              
+              $sessionRemaining = $sessionEnd - $currentTime
+              $sessionMinutes = [math]::Round($sessionRemaining.TotalMinutes, 0)
+              
+              if ($remainingDays -le 0) {
+                  Write-Host "🎊 30-day period completed!"
+                  break
+              }
+              
+              Write-Host "[$currentTime] RDP Active - Day $daysPassed/30 - Remaining: $remainingDays days - Next restart: $sessionMinutes min"
+              
+              try {
+                  $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+                  if ($rdpService.Status -ne 'Running') {
+                      Write-Host "🔄 Restarting RDP service..."
+                      Start-Service -Name "TermService" -ErrorAction SilentlyContinue
+                  }
+                  
+                  $tcpTest = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -InformationLevel Quiet -WarningAction SilentlyContinue
+                  if (-not $tcpTest) {
+                      Write-Host "🔄 RDP port not responding, restarting service..."
+                      Restart-Service -Name "TermService" -Force -ErrorAction SilentlyContinue
+                  }
+              } catch {
+                  Write-Host "⚠️ Service check: $($_.Message)"
+              }
+              
+              Start-Sleep -Seconds 300
+          }
+          
+          Write-Host "🔄 Session completed - Auto-restarting in 15 minutes"
